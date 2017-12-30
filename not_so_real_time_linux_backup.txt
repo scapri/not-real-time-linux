@@ -1,0 +1,504 @@
+Sandra, what about using stress and cyclictest defined in http://linuxrealtime.org/index.php/Improving_the_Real-Time_Properties#Isolating_CPUs instead of your dumb little scripts?
+
+SANDRA, /sys/devices/virtual/workqueue/cpumask returns an 'f' - this makes it look like work queues may be put on CPU core 3 (WORK_CPU_UNBOUND) - must be root - is this needed if we use cpusets?
+I found this here:
+https://stackoverflow.com/questions/40774217/cannot-avoid-context-switches-on-a-process-launched-alone-on-a-cpu
+
+turning off real time throttling: echo -1 > /proc/sys/kernel/sched_rt_runtime_us
+https://www.kernel.org/doc/Documentation/scheduler/sched-rt-group.txt
+
+As of October 31, 2017, isolcpus was marked as deprecated.  Future work: use cpusets cpusets instead - but this is to allow dynamic load balancing through the "cpuset.sched_load_balance" file.
+https://www.kernel.org/doc/Documentation/cgroup-v1/cpusets.txt
+SANDRA, this website - starting with "Isolating the Application" talks about how to use cpusets to isolate cpus instead of isolcpus!!!!!!  Do this  note that we don't have NUMA
+http://linuxrealtime.org/index.php/Improving_the_Real-Time_Properties#Isolating_CPUs  OOPS, note that this still talks about isolcpus - but maybe this will help me understand cpusets....
+
+default IRQ affinity masks - how to turn irqs off on our #3?  or only the ones we want?  same with kernel timers?  or will bad things happen if we turn of irqs and kernel timers since we might want them?  Or do these needs go away with cpusets?
+
+Statement of the problem:
+
+Can a small embedded Linux system (e.g. SBC like the Raspberry Pie or BeagleBone Black) run a task deterministically enough to control external devices?  For the purpose of this paper, can an SBC be used to generate a pulse of 11ms or longer with a < 1ms resolution?  If there is a single task driving a GPIO on an SBC, will it be able to deassert that GPIO after 11ms +/- 1/2 ms?
+
+Problems - Unless you are using the Real Time Linux patches, Linux is not real time.  If there are lots of tasks running on the system, the latency is not bounded, and can be very large.
+
+Solutions considered:
+* Assert a GPIO, then do an 11ms delay in the kernel (sleep or busy-wait)
+     * old fashioned Linux timers work in jiffies (what is one of these function calls called???) (multiple millisecond resolution), so doesn't meet the < 1ms resolution requirement
+	 * Linux high resolution timers are specified in nanoseconds (but SBCs don't support ns granularity - 10-100usec is more normal).  The task will run at the time you specified or later (no guarantees as to how much later it could run).
+* On a multi-core system, dedicate a core to just controlling pulses, either keeping the core part of the Linux system, or a bare metal process. (disadvantages to bare metal - lose the benefits of Linux - system features available, and communication with other processes on the other cores).  One way of doing this is to isolate the core with Linux functionality.
+* Keep the code in the L1 cache - avoid latency due to cache misses (sandra, create a section talking about latency due to cache misses).
+* Setting the GPIO task at a high priority compared to the rest of the system can mitigate latency issues, but there are no guarentees.  The Linux scheduler supports two "realtime" policies: SCHED_FIFO or SCHED_RR.
+* Turning off kernel pre-emption for that core??? or task??? using CONFIG_PREEMPT_NONE
+
+
+Early on, I discovered the book "Raspberry Pi IoT in C"  that claims by locking a process to a core, and using Linux “realtime” scheduling (high priority SCHED_FIFO), that a pulse width of 15 microseconds is reasonable. I didn't see any dicussion of isolating the core, which could make things even beter.
+http://www.iot-programmer.com/index.php?option=com_content&view=article&id=33&catid=22&Itemid=110
+
+This book seems to do much of its work in user space, not kernel space, so I tried running tests in user space first.
+
+I decided that a good first prototype could be:
+  1) Isolating one of the 4 cores on a Raspberry Pi 3.
+  2) Create a GPIO writing task that outputs 10 ms pulses (or less for checking accuracy).
+  3) Lock the GPIO writing task to the isolated core.
+  3) Make sure that task is high priority SCHED_FIFO.
+  4) Turn off preemption on that core. (sandra, kernel version only???)
+  5) Lock the task into memory to keep it from paging out (mlockall(MCL_CURRENT)) - this applies to user space only
+  5) Run a bunch of busy-work user space programs on the Raspberry Pi.
+  6) Measure the output from the GPIO to see how accurate the pulses are over time. (internal measure, external measure)
+
+HOWTO:
+* Isolate a core - modify file /boot/cmdline.txt to add the isolcpus directive to the line.  For example, to isolate core 3, add this to the line:
+    isolcpus=3
+  This will leave cores 0, 1, and 2 in the normal Linux pool, but prevent the scheduler from putting any normal tasks on core 3.  Verify this worked by doing:
+    $ cat /sys/devices/system/cpu/isolated
+  (after rebooting to make the isolcpus line take affect).  The number "3" should be returned.
+
+* Specify a user space program to run on the isolated core - first calculate the mask that specifies that core.  With the cores numbered 0-3, core 0's mask is 0x1, core 1's mask is 0x2, core 2's mask is 0x4, and core3's mask is 0x8:
+   $ taskset 0x8 programname
+  will run the program called programname on core 3.
+
+* See which core a certain process is pinned to (if any): taskset -cp <pid>
+  Where <pid> is the process id - for example, if user_pulse is process 943:
+    $ taskset -cp 943
+    pid 943's current affinity list: 3
+
+* To see which core a certain process is actually running on: ps -o pid,psr,comm -p <pid>
+  Where <pid> is the process id - for example, if user pulse is process 943:
+    $ ps -o pid,psr,comm -p 943
+       PID PSR COMMAND
+       943   3 user_pulse
+  The PSR column shows that user_pulse is running on CPU core 3.  This should not change for this processes, since, as we saw in the taskset command, this process is pinned to CPU core 3.  But in general, unpinned processes can be scheduled onto any unisolated ocre
+
+This is a nice verification that the user space program really is running on the correct CPU core
+
+To verify that there are no other processes running on our isolated core, there is a slight variation on the previous command:
+    $ ps -eo pid,psr,comm
+Which shows a bunch of output, including a few processes on CPU core 3!  There will be a few kworker threads, as well as ksoftirqd, and migration.
+WHY?  SANDRA FILL IN!!!!
+
+You can also use the top command to see which CPU core is being used for processes, after running "top", hit 'f', then use the down arrow to highlight "P   = Last Used Cpu (SMP)", then hit 'd' to display the field, and 's' to sort on it (if you wish), then 'q' to return to the display.
+
+
+User space - functionality of the program:
+1. Get and store the current time
+2. Write the GPIO line high.
+3. Do a usleep (this is not a busy-wait loop - the Linux system sleeps the task)
+4. Write the GPIO line low.
+5. Get and store the current time - compare to the start time in step 1 (verify the clock hasn't rolled over, etc).
+6. Store the shortest time (to verify the pulse wasn't too short), and the the longest time (to see the worst case error in pulse length).
+
+I first ran the system without isolating one of the cores, without locking the writing task to the isolated core, without SCHED_FIFO, and without locking the task into memory.
+
+Non realtime results
+ideal pulse  shortest pulse  longest pulse
+(usec)       (rounded usec)  (rounded usec)
+-------------------------------------------------------------------------
+10,000       10,060          14,000 (some runs showed > 20,000 usec)
+ 1,000        1,060           7,100 (some runs showed > 9,000 usec)
+   100          140           2,900 (some runs showed >  6,200 usec)
+    10           30           1,500 (some runs showed >  6,900 usec)
+
+
+The general idea here is that latency is very unpredictable.  Since any of the busy tasks can be thrown onto the same CPU core as the one controlling the GPIO, the pulse width can vary a lot.
+
+With all of the previous work defined (sandra, rework this)
+User space - Kinda sorta realtime results
+ideal pulse  shortest pulse  longest pulse
+(usec)       (rounded usec)  (rounded usec)
+-------------------------------------------------------------------------
+10,000       10,060          10,230
+ 1,000        1,060           1,200
+   100          140             260
+    10           30             160
+
+So obviously, these modifications are giving more control - the pulse widths are staying within boundaries compared to the unmodified Linux system.
+
+Note that the shortest pulse is never too short.  This is expected - from the Linux man page usleep(3): "The usleep function suspends execution of the calling thread for (at least) usec microseconds. The sleep may be lengthened slightly by any system activity or by the time spent processing the call or by the granularity of system timers."
+
+If the goal is to be able to control a pulse of 10ms, with an error of 300usec or less, user space does look possible.  It is disappointing to see the 100usec pulse having a > 200usec error, and the 10usec pulse having a > 150usec error.  More work could be done to investigate other ways to get better resolution/less error in pulses generated form user space.  But my goal was to move to kernel space.
+
+************kernel space***************
+
+Sandra, for stopping preemption, function get_cpu will disable preemption - try it!
+SANDRA FIXME - this is still in an init - move this to a probe function!!!
+
+
+Still using the mechanism to isolate cpu core 3, instead of working in user space, Appendix ?? has code that drives a GPIO.  This code:
+
+* Writes to gpios directly (avoiding any unknown code delays)
+* Sets the cpu affinity with function set_cpus_allowed_ptr
+* Sets the scheduling to high priority SCHED_FIFO.
+??? locking in memory?
+* Is set up to test sleep (mdelay) vs. busy-wait (usleep_range)  (to determine which is a beter fit for a given system).
+
+Other ideas:
+* Disable kernel preemption: use function get_cpu to disable kernel preemption and return the cpu id.  When done, function put_cpu must be called.
+
+
+
+results without turning off kernel pre-emption
+Kernel module - Kinda sorta realtime results
+ideal pulse  shortest pulse  longest pulse
+(usec)       (rounded usec)  (rounded usec)   average  wait mechanism
+-------------------------------------------------------------------------
+10,000       10,000          10,136           10,001   mdelay (busy wait)
+10,000       10,009          10,101           10,040   usleep_range (kernel sleep)
+ 1,000        1,000           1,065            1,002   mdelay (busy wait)
+ 1,000        1,009           1,104            1,033   usleep_range (kernel sleep)
+   100          100             191              100   mdelay (busy wait)
+   100          108             204              113   usleep_range (kernel_sleep)
+    10           10             102               11   mdelay (busy wait)
+    10           14             116               21   usleep_range (kernel_sleep)
+
+
+
+results WITH turning off kernel pre-emption using get_cpu
+Kernel module - Kinda sorta realtime results
+ideal pulse  shortest pulse  longest pulse
+(usec)       (rounded usec)  (rounded usec)   average  wait mechanism
+-------------------------------------------------------------------------
+10,000       10,000          10,062           10,003   mdelay (busy wait)
+?10,000       10,009          10,101           10,040   usleep_range (kernel sleep)
+? 1,000        1,000           1,065            1,002   mdelay (busy wait)
+? 1,000        1,009           1,104            1,033   usleep_range (kernel sleep)
+?   100          100             191              100   mdelay (busy wait)
+?   100          108             204              113   usleep_range (kernel_sleep)
+?    10           10             102               11   mdelay (busy wait)
+?    10           14             116               21   usleep_range (kernel_sleep)
+
+NOTE we did get a rcu_sched self-detected stall on CPU 3
+[ 5927.111531] INFO: rcu_sched self-detected stall on CPU
+[ 5927.111552] 	3-...: (2098 ticks this GP) idle=de7/140000000000001/0 softirq=26194/27497 fqs=2100
+[ 5927.111558] 	 (t=2100 jiffies g=85 c=84 q=2)
+[ 5927.111567] Task dump for CPU 3:
+[ 5927.111572] bash            R running      0 25182  25180 0x00000002
+[ 5927.111602] [<80018ae8>] (unwind_backtrace) from [<800142bc>] (show_stack+0x20/0x24)
+[ 5927.111616] [<800142bc>] (show_stack) from [<8005027c>] (sched_show_task+0xc4/0x118)
+[ 5927.111628] [<8005027c>] (sched_show_task) from [<800525b0>] (dump_cpu_task+0x48/0x4c)
+[ 5927.111641] [<800525b0>] (dump_cpu_task) from [<8007a528>] (rcu_dump_cpu_stacks+0x9c/0xd8)
+[ 5927.111653] [<8007a528>] (rcu_dump_cpu_stacks) from [<8007eabc>] (rcu_check_callbacks+0x6b4/0xaf4)
+[ 5927.111664] [<8007eabc>] (rcu_check_callbacks) from [<800849e4>] (update_process_times+0x48/0x74)
+[ 5927.111677] [<800849e4>] (update_process_times) from [<80095fd4>] (tick_sched_handle+0x58/0x64)
+[ 5927.111688] [<80095fd4>] (tick_sched_handle) from [<80096044>] (tick_sched_timer+0x64/0xa8)
+[ 5927.111698] [<80096044>] (tick_sched_timer) from [<80085608>] (__hrtimer_run_queues+0x160/0x3c8)
+[ 5927.111708] [<80085608>] (__hrtimer_run_queues) from [<80086150>] (hrtimer_interrupt+0xc0/0x208)
+[ 5927.111721] [<80086150>] (hrtimer_interrupt) from [<8049a2bc>] (arch_timer_handler_phys+0x40/0x48)
+[ 5927.111735] [<8049a2bc>] (arch_timer_handler_phys) from [<80075fb4>] (handle_percpu_devid_irq+0x9c/0x228)
+[ 5927.111748] [<80075fb4>] (handle_percpu_devid_irq) from [<80071578>] (generic_handle_irq+0x34/0x44)
+[ 5927.111759] [<80071578>] (generic_handle_irq) from [<800718a4>] (__handle_domain_irq+0x8c/0xfc)
+[ 5927.111770] [<800718a4>] (__handle_domain_irq) from [<80010c54>] (handle_IRQ+0x2c/0x30)
+[ 5927.111782] [<80010c54>] (handle_IRQ) from [<80009550>] (bcm2836_arm_irqchip_handle_irq+0xb4/0xb8)
+[ 5927.111793] [<80009550>] (bcm2836_arm_irqchip_handle_irq) from [<805c84c4>] (__irq_svc+0x44/0x7c)
+[ 5927.111799] Exception stack(0xa923bd58 to 0xa923bda0)
+
+
+
+pulse train measured between 10.007ms to 10.120ms (on a very busy system with many hundreds - SANDRA HOW MANY DID WE SEE??? - of user space programs running)
+
+Which kind of delay should be used - a busy/wait delay or a kernel sleep.  More information can be found at https://www.kernel.org/doc/Documentation/timers/timers-howto.txt
+
+Dedicating a core but staying part of the system:
+Were we able to turn off pre-emption on this core?
+
+SANDRA, if we didn't set interrupt IRQ affinity to the other CPUS, then could we have had IRQs running on this CPU????  TRY AND SEE IF THE TIMES ARE BETTER!!!!!
+
+Future work - interrupt latency - what is the maximum delay from an external event triggering an interrupt?  Tying an interrupt to a single core (bind interrupt to the isolated processor)
+
+Put into an appendix?  The example code uses function set_cpus_allowed_ptr, which works well for the current process.  Other functions that can be useful for setting the affinity for other threads/processes:
+ 	• function kthread_create_on_cpu - Creates a new thread bound to a specific CPU core.  The thread will be created in sleep state (parked).  Unfortunately, this is not exported by the kernel, so to duplicate this functionality in a driver module, use function kthread_create followed by function kthread_bind.
+	• function kthread_create followed by function kthread_bind - works very similarly to function kthread_create_on_cpu, but is available to driver modules.
+	• find_process_by_pid(pid) - Given the process id, return the task structure (to pass to a function like set_cpus_allowed_ptr).  If the pid is null, returns task_struct * of current process.
+
+
+
+
+
+
+SCHED_FIFO information from man page for sched(7) (4.14):
+
+       The scheduler is the kernel component that decides which runnable
+       thread will be executed by the CPU next.  Each thread has an
+       associated scheduling policy and a static scheduling priority,
+       sched_priority.  The scheduler makes its decisions based on knowledge
+       of the scheduling policy and static priority of all threads on the
+       system.
+
+      For threads scheduled under one of the normal scheduling policies
+       (SCHED_OTHER, SCHED_IDLE, SCHED_BATCH), sched_priority is not used in
+       scheduling decisions (it must be specified as 0).
+
+       Processes scheduled under one of the real-time policies (SCHED_FIFO,
+       SCHED_RR) have a sched_priority value in the range 1 (low) to 99
+       (high).  (As the numbers imply, real-time threads always have higher
+       priority than normal threads.) ...
+
+       ... when a SCHED_FIFO threads becomes runnable, it will
+       always immediately preempt any currently running SCHED_OTHER,
+       SCHED_BATCH, or SCHED_IDLE thread.  SCHED_FIFO is a simple scheduling
+       algorithm without time slicing.
+	   ...
+
+       A SCHED_FIFO thread runs until either it is blocked by an I/O
+       request, it is preempted by a higher priority thread, or it calls
+       sched_yield(2).
+
+       SCHED_RR is a simple enhancement of SCHED_FIFO.  Everything described
+       above for SCHED_FIFO also applies to SCHED_RR, except that each
+       thread is allowed to run only for a maximum time quantum.  If a
+       SCHED_RR thread has been running for a time period equal to or longer
+       than the time quantum, it will be put at the end of the list for its
+       priority.
+
+...
+
+       setpriority(2)
+              Set the nice value of a thread, a process group, or the set of
+              threads owned by a specified user.
+
+       sched_setscheduler(2)
+              Set the scheduling policy and parameters of a specified
+              thread.
+
+       sched_setparam(2)
+              Set the scheduling parameters of a specified thread.
+
+       sched_yield(2)
+              Cause the caller to relinquish the CPU, so that some other
+              thread be executed.
+
+       sched_setaffinity(2)
+              (Linux-specific) Set the CPU affinity of a specified thread.
+
+       sched_setattr(2)
+              Set the scheduling policy and parameters of a specified
+              thread.  This (Linux-specific) system call provides a superset
+              of the functionality of sched_setscheduler(2) and
+              sched_setparam(2).
+
+
+
+Acronym definitions:
+SBC - Single Board Computer
+
+
+Appendices:
+Appendix A Shell Scripts:
+
+Shell scripts to create busy-work user space programs (uses the processor for computing power functions, echoes the value out to the screen, calls the date function, and looks for a file on the filesystem to create IO events as well)
+
+Shell script testprogram will keep running until the file ".stoprunning" is created:
+while true
+do
+   echo "this is a test"
+   date
+   true
+   echo $((13**99)) 1>/dev/null 2>&1
+   if [ -e ~/.stoprunning ]
+   then
+      echo "$0 stop"
+      exit
+   fi
+done
+
+Since busy.sh creates only 1 process, the shell script runbusy.sh will create as many background instances of the busy.sh process as the Linux system will allowuntil the file ".stoprunning" is created:
+while true
+do
+   echo "Running script $0"
+   ./busy.sh &
+   if [ -e ~/.stoprunning ]
+   then
+      echo "$0 is stopping"
+      exit
+   fi
+done
+
+
+APPENDIX B - User space source code:
+
+To compile this code on the Raspberry Pi, put the following C source code in a file called user_pulse.c, and execute:
+cc -o user_pulse user_pulse.c -lbcm2835
+**************** user_pulse.c C source code ****************
+// To isolate the core, edit the file /boot/cmdline.txt to have
+// isolcpus=3 (keep any task from normally being scheduled on the 4th
+// core)
+//
+// To assign this program to that isolated core, run it with:
+// taskset 0x8 ./user_pulse 10000
+//
+// Where 0x8 is the mask for the 4th core (1000b), and the 10000
+// is the number of microseconds for the asserted pulse in the
+// pulse train (the deasserted portion of the pulse is much smaller,
+// since we don't care about its measurement).
+
+
+#include <bcm2835.h>
+#include <stdio.h>
+#include <time.h>
+#include <sched.h>
+#include <sys/mman.h>
+
+int main(int argc, char **argv)
+{
+    volatile int delay;
+    int i;
+    long int start_time;
+    long int time_difference, shortest, longest;
+    struct timespec gettime_now;
+    int sleeptime, loopsize;
+
+    const struct sched_param priority = {99};
+
+    sched_setscheduler(0, SCHED_FIFO, &priority);
+    printf("YES locked in memory\n");
+    mlockall(MCL_CURRENT); // lock in memory to keep us from paging out
+
+    if (argc < 2)
+    {
+        printf("You didn't supply a time, so we assume 10 msec (10000)\n");
+        sleeptime = 10000;
+    }
+    else
+    {
+        sscanf(argv[1], "%d", &sleeptime);
+        printf("User-requested sleeptime of %dusec\n", sleeptime);
+    }
+
+    loopsize = 10000;
+    if (sleeptime < 10000)
+        loopsize = 10000/sleeptime * loopsize;
+    printf("loopsize of %d\n", loopsize);
+
+
+    if (!bcm2835_init())
+    {
+        printf("oops\n");
+        return 1;
+    }
+
+    shortest = 0x7FFFFFFF;  // initialize the shortest/longest variables
+    longest = 0;
+    bcm2835_gpio_fsel(RPI_BPLUS_GPIO_J8_07, BCM2835_GPIO_FSEL_OUTP);
+#if 0
+    // this code is only used when first hooking up the logic
+    // analyzer/oscope to verify you're looking at the right lines
+    printf("holding the line LOW for 20 seconds\n");
+    bcm2835_gpio_write(RPI_BPLUS_GPIO_J8_07, LOW);
+    usleep(20 * 1000 * 1000);
+    printf("holding the line high for 20 seconds\n");
+    bcm2835_gpio_write(RPI_BPLUS_GPIO_J8_07, HIGH);
+    usleep(20 * 1000 * 1000);
+    bcm2835_gpio_write(RPI_BPLUS_GPIO_J8_07, LOW);
+#endif
+    for(i=0;i<loopsize;i++)
+    {
+        clock_gettime(CLOCK_REALTIME, &gettime_now);
+        start_time = gettime_now.tv_nsec;
+
+        // assert the GPIO
+        bcm2835_gpio_write(RPI_BPLUS_GPIO_J8_07, HIGH);
+
+        usleep(sleeptime); // user-requested sleep time
+
+        // deassert the GPIO
+        bcm2835_gpio_write(RPI_BPLUS_GPIO_J8_07, LOW);
+
+        clock_gettime(CLOCK_REALTIME, &gettime_now);
+        time_difference = gettime_now.tv_nsec - start_time;
+        if (time_difference < 0)
+        {
+            time_difference += 1000000000; //(Rolls over every 1 second)
+            printf("Rolled over, i=%d, shortest=%ld, longest=%ld\n",i,
+                   shortest, longest);
+        }
+
+        if (time_difference < shortest)
+            shortest = time_difference; // save away shortest time
+        if (time_difference > longest)
+            longest = time_difference; // save away longest time
+    }
+    printf("longest pulse time was %d, shortest %d\n", longest, shortest);
+}
+
+APPENDIX C -
+To compile this code into a kernel module on a Raspberry Pi
+make -C /lib/modules/`uname -r`/build M=$PWD
+(note that you need to have the correct Linux kernel headers on the machine.  The easiest way to do this is to load the Linux source, and build the kernel on the Raspberry Pi)
+
+
+
+APPENDIX D  - how to run the user space program and the busy scripts on the Raspberry Pi
+(first make sure you have properly isolated a core with the isolcpus command.  Verify this worked by doing:    cat /sys/devices/system/cpu/isolated )
+ if the output is a 3, and you did isolcpus=3, then you are good)
+
+* create 3 terminal windows (either ssh into the RPi, or in the RPi GUI)
+
+To allow the busy scripts to run, in terminal 1:
+   rm ~/.stoprunning
+
+To run the busy scripts, in terminal 2:
+   ./runbusy.sh
+
+To stop the busy scripts, in terminal 1:
+   touch ~/.stoprunning
+
+To run the userspace program on with a 10ms pulse train, in terminal 3:
+   taskset 0x8 ./user_pulse 10000
+   (the value you provide is in microseconds, so scale accordingly)
+
+And normally, I would be running top in terminal 1, to see if anything was on CPU core 3.  Note that this also adds to the execution load on the system.
+
+
+APPENDIX E  - how to run the kernel module and the busy scripts on the Raspberry Pi
+(first make sure you have properly isolated a core with the isolcpus command.  Verify this worked by doing:    cat /sys/devices/system/cpu/isolated )
+ if the output is a 3, and you did isolcpus=3, then you are good)
+
+* create 4 terminal windows (either ssh into the RPi, or in the RPi GUI)
+
+To allow the busy scripts to run, in terminal 1:
+   rm ~/.stoprunning
+
+To run the busy scripts, in terminal 2:
+   ./runbusy.sh
+
+To stop the busy scripts, in terminal 1:
+   touch ~/.stoprunning
+
+To run the kernel module, in terminal 3:
+   sudo insmod gpio_pulse.ko
+   sudo chmod 666 /sys/gpio_control/*
+   echo g > /sys/gpio_control/pulse_run **** SANDRA WARNING MUST BE ROOT OR THE PRIORITY IS BAD!!!  WAS THIS A PROBLEM FOR THE USER SPACE PROGRAM????
+
+To see the results from the run:
+   cat /sys/gpio_control/pulse_run
+
+To see which gpio pin is being driven:
+   cat /sys/gpio_control/gpio_pin
+Note, this is the gpio number, not the pin number on connector J8.  To see how these relate to each other, look at the schematic (see Appendix F) "GPIO EXPANSION" and "J8".  You will see that GPIO4 is on J8 pin 7 (the default for this example).
+
+To see the output from kernel module, type "dmesg" in an terminal 4.  To continually watch the output, type "tail -f /var/log/kern.log"
+
+To modify the defined run parameters (which GPIO pin to drive, and the width of the pulse):
+   echo 5 > /sys/gpio_control/gpio_pin  (this changes the pin to drive to GPIO5 (J8 pin 29)
+   echo 1000 > /sys/gpio_control/pulse_width  (this changes the pulse width to 1000usec)
+
+If you have modified the kernel module and need re-install it, you have to uninstall the module, before re-installing it:
+   sudo rmmod gpio_pulse.ko
+   sudo insmod gpio_pulse.ko
+
+And normally, I would be running top in terminal 1, to see if anything was on CPU core 3.  Note that this also adds to the execution load on the system.
+
+APPENDIX F - pinouts for a Raspberry Pi 3 GPIO Header
+There are lots of pinouts online, the official schematics are here:
+https://www.raspberrypi.org/documentation/hardware/raspberrypi/schematics/Raspberry-Pi-3B-V1.2-Schematics.pdf
+The code for user space and kernel space uses pin 7 on connecter J8 (GPIO4).
+
+Web pages:
+There were many hundreds of web pages used to research information on this paper.  Here are several I found useful:
+
+How to find out which CPU core a process is running on
+http://ask.xmodulo.com/cpu-core-process-is-running.html
+
+Sources of CPU interference in core Linux code
+https://github.com/gby/linux/wiki
+
+per-CPU kthreads
+https://www.kernel.org/doc/Documentation/kernel-per-CPU-kthreads.txt
