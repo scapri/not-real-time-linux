@@ -4,8 +4,6 @@ SANDRA, /sys/devices/virtual/workqueue/cpumask returns an 'f' - this makes it lo
 I found this here:
 https://stackoverflow.com/questions/40774217/cannot-avoid-context-switches-on-a-process-launched-alone-on-a-cpu
 
-turning off real time throttling: echo -1 > /proc/sys/kernel/sched_rt_runtime_us
-https://www.kernel.org/doc/Documentation/scheduler/sched-rt-group.txt
 
 As of October 31, 2017, isolcpus was marked as deprecated.  Future work: use cpusets cpusets instead - but this is to allow dynamic load balancing through the "cpuset.sched_load_balance" file.
 https://www.kernel.org/doc/Documentation/cgroup-v1/cpusets.txt
@@ -16,7 +14,7 @@ default IRQ affinity masks - how to turn irqs off on our #3?  or only the ones w
 
 Statement of the problem:
 
-Can a small embedded Linux system (e.g. SBC like the Raspberry Pie or BeagleBone Black) run a task deterministically enough to control external devices?  For the purpose of this paper, can an SBC be used to generate a pulse of 11ms or longer with a < 1ms resolution?  If there is a single task driving a GPIO on an SBC, will it be able to deassert that GPIO after 11ms +/- 1/2 ms?
+Can a small embedded Linux system (e.g. SBC like the Raspberry Pie or BeagleBone Black) run a task deterministically enough to control external devices?  For the purpose of this paper, can an SBC be used to generate a pulse of 11ms or longer with a < 500usec resolution?  If there is a single task driving a GPIO on an SBC, will it be able to deassert that GPIO after 11ms +/- 1/2 ms?
 
 Problems - Unless you are using the Real Time Linux patches, Linux is not real time.  If there are lots of tasks running on the system, the latency is not bounded, and can be very large.
 
@@ -25,15 +23,17 @@ Solutions considered:
      * old fashioned Linux timers work in jiffies (what is one of these function calls called???) (multiple millisecond resolution), so doesn't meet the < 1ms resolution requirement
 	 * Linux high resolution timers are specified in nanoseconds (but SBCs don't support ns granularity - 10-100usec is more normal).  The task will run at the time you specified or later (no guarantees as to how much later it could run).
 * On a multi-core system, dedicate a core to just controlling pulses, either keeping the core part of the Linux system, or a bare metal process. (disadvantages to bare metal - lose the benefits of Linux - system features available, and communication with other processes on the other cores).  One way of doing this is to isolate the core with Linux functionality.
-* Keep the code in the L1 cache - avoid latency due to cache misses (sandra, create a section talking about latency due to cache misses).
+* Keep the code in the L1 cache - avoid latency due to cache misses (sandra, create a section talking about latency due to cache misses).  I DIDN'T DO THIS
 * Setting the GPIO task at a high priority compared to the rest of the system can mitigate latency issues, but there are no guarentees.  The Linux scheduler supports two "realtime" policies: SCHED_FIFO or SCHED_RR.
-* Turning off kernel pre-emption for that core??? or task??? using CONFIG_PREEMPT_NONE
+* Turning off kernel pre-emption for that core??? or task??? Disable kernel preemption: use function get_cpu to disable kernel preemption and return the cpu id.  When done, function put_cpu must be called. - Make notes - should only do this in critical sections.  If critical section is large, can create problems with rcu_sched self-detected stalls.  If you need to turn off stall detection, can do with  sudo sh -c "echo 1 > /sys/module/rcupdate/parameters/rcu_cpu_stall_suppress " (I did for my timing in kernel space)
+* Turn off real time throttling: sudo sh -c 'echo -1 > /proc/sys/kernel/sched_rt_runtime_us'
+https://www.kernel.org/doc/Documentation/scheduler/sched-rt-group.txt
 
 
 Early on, I discovered the book "Raspberry Pi IoT in C"  that claims by locking a process to a core, and using Linux “realtime” scheduling (high priority SCHED_FIFO), that a pulse width of 15 microseconds is reasonable. I didn't see any dicussion of isolating the core, which could make things even beter.
 http://www.iot-programmer.com/index.php?option=com_content&view=article&id=33&catid=22&Itemid=110
 
-This book seems to do much of its work in user space, not kernel space, so I tried running tests in user space first.
+This book seems to work in user space, not kernel space, so I tried running tests in user space first.
 
 I decided that a good first prototype could be:
   1) Isolating one of the 4 cores on a Raspberry Pi 3.
@@ -46,7 +46,7 @@ I decided that a good first prototype could be:
   6) Measure the output from the GPIO to see how accurate the pulses are over time. (internal measure, external measure)
 
 HOWTO:
-* Isolate a core - modify file /boot/cmdline.txt to add the isolcpus directive to the line.  For example, to isolate core 3, add this to the line:
+* Isolate a core - modify file /boot/cmdline.txt to add the isolcpus directive to the line.  For example, to isolate core 3, add this to the line:  (MOVE THIS SECTION TO APPENDIX, AND JUST TALK ABOUT ISOLATING THE CPU, and MENTION THIS BOOT DIRECTIVE HAS BEEN DEPRECATED - FUTURE INVESTIGATION)
     isolcpus=3
   This will leave cores 0, 1, and 2 in the normal Linux pool, but prevent the scheduler from putting any normal tasks on core 3.  Verify this worked by doing:
     $ cat /sys/devices/system/cpu/isolated
@@ -105,16 +105,16 @@ User space - Kinda sorta realtime results
 ideal pulse  shortest pulse  longest pulse
 (usec)       (rounded usec)  (rounded usec)
 -------------------------------------------------------------------------
-10,000       10,060          10,230
- 1,000        1,060           1,200
-   100          140             260
-    10           30             160
+10,000       10,024          10,092
+ 1,000        1,009           1,097
+   100          109             179
+    10           15              97
 
 So obviously, these modifications are giving more control - the pulse widths are staying within boundaries compared to the unmodified Linux system.
 
 Note that the shortest pulse is never too short.  This is expected - from the Linux man page usleep(3): "The usleep function suspends execution of the calling thread for (at least) usec microseconds. The sleep may be lengthened slightly by any system activity or by the time spent processing the call or by the granularity of system timers."
 
-If the goal is to be able to control a pulse of 10ms, with an error of 300usec or less, user space does look possible.  It is disappointing to see the 100usec pulse having a > 200usec error, and the 10usec pulse having a > 150usec error.  More work could be done to investigate other ways to get better resolution/less error in pulses generated form user space.  But my goal was to move to kernel space.
+If the goal is to be able to control a pulse of 10ms, with an error of 200usec or less, user space does look possible.  It is disappointing to see the 100usec pulse having a > 150usec error, and the 10usec pulse having a > 80usec error.  More work could be done to investigate other ways to get better resolution/less error in pulses generated form user space.  But my goal was to move to kernel space.
 
 ************kernel space***************
 
@@ -131,23 +131,22 @@ Still using the mechanism to isolate cpu core 3, instead of working in user spac
 * Is set up to test sleep (mdelay) vs. busy-wait (usleep_range)  (to determine which is a beter fit for a given system).
 
 Other ideas:
-* Disable kernel preemption: use function get_cpu to disable kernel preemption and return the cpu id.  When done, function put_cpu must be called.
 
 
 
-results without turning off kernel pre-emption
+results WITHOUT turning off kernel pre-emption
 Kernel module - Kinda sorta realtime results
 ideal pulse  shortest pulse  longest pulse
 (usec)       (rounded usec)  (rounded usec)   average  wait mechanism
 -------------------------------------------------------------------------
-10,000       10,000          10,136           10,001   mdelay (busy wait)
-10,000       10,009          10,101           10,040   usleep_range (kernel sleep)
- 1,000        1,000           1,065            1,002   mdelay (busy wait)
- 1,000        1,009           1,104            1,033   usleep_range (kernel sleep)
-   100          100             191              100   mdelay (busy wait)
-   100          108             204              113   usleep_range (kernel_sleep)
-    10           10             102               11   mdelay (busy wait)
-    10           14             116               21   usleep_range (kernel_sleep)
+10,000       10,000          10,072           10,005   mdelay (busy wait)
+10,000       10,009          10,093           10,040   usleep_range (kernel sleep)
+ 1,000        1,000           1,062            1,002   mdelay (busy wait)
+ 1,000        1,007           1,095            1,036   usleep_range (kernel sleep)
+   100          100             170              101   mdelay (busy wait)
+   100          107             151              114   usleep_range (kernel_sleep)
+    10           10              87               11   mdelay (busy wait)
+    10           14              74               22   usleep_range (kernel_sleep)
 
 
 
@@ -156,14 +155,14 @@ Kernel module - Kinda sorta realtime results
 ideal pulse  shortest pulse  longest pulse
 (usec)       (rounded usec)  (rounded usec)   average  wait mechanism
 -------------------------------------------------------------------------
-10,000       10,000          10,062           10,003   mdelay (busy wait)
-?10,000       10,009          10,101           10,040   usleep_range (kernel sleep)
-? 1,000        1,000           1,065            1,002   mdelay (busy wait)
-? 1,000        1,009           1,104            1,033   usleep_range (kernel sleep)
-?   100          100             191              100   mdelay (busy wait)
-?   100          108             204              113   usleep_range (kernel_sleep)
-?    10           10             102               11   mdelay (busy wait)
-?    10           14             116               21   usleep_range (kernel_sleep)
+10,000       10,000          10,063           10,003   mdelay (busy wait)
+ 1,000        1,000           1,060            1,002   mdelay (busy wait)
+   100          100             152              100   mdelay (busy wait)
+    10           10              88               11   mdelay (busy wait)
+
+(note that sleep with kernel preemption turned off is not part of theses results, since this combination can cause the kernel to generate messages such as:
+BUG: scheduling while atomic: sh/16301/0x00000002
+
 
 NOTE we did get a rcu_sched self-detected stall on CPU 3
 [ 5927.111531] INFO: rcu_sched self-detected stall on CPU
@@ -282,24 +281,46 @@ SBC - Single Board Computer
 
 Appendices:
 Appendix A Shell Scripts:
+(to execute shell scripts directly, you need to make sure their execute permission is set - chmod +x utils/*.sh)
 
 Shell scripts to create busy-work user space programs (uses the processor for computing power functions, echoes the value out to the screen, calls the date function, and looks for a file on the filesystem to create IO events as well)
 
-Shell script testprogram will keep running until the file ".stoprunning" is created:
+The following shell script will keep running until the file ".stoprunning" is created:
+********* utils/busy.sh *********
+#!/bin/bash
+# script to do some processor and I/O work to keep things busy
+
 while true
 do
    echo "this is a test"
    date
    true
+   # do some processor work
    echo $((13**99)) 1>/dev/null 2>&1
+   # do some I/O work
+   sync
+
+   # check to see if user has created the "stop" file
    if [ -e ~/.stoprunning ]
    then
-      echo "$0 stop"
+#      echo "$0 stop"
       exit
    fi
-done
 
-Since busy.sh creates only 1 process, the shell script runbusy.sh will create as many background instances of the busy.sh process as the Linux system will allowuntil the file ".stoprunning" is created:
+Since busy.sh creates only 1 process, the following shell script runbusy.sh will create as many background instances of the busy.sh process as the Linux system will allow until the file ".stoprunning" is created.  Note that the script will stop in 100 seconds to avoid the kernel complaining that a task is blocked for more than 120 seconds.  (There's a little more info about that at https://helpful.knobs-dials.com/index.php/INFO:_task_blocked_for_more_than_120_seconds. and more info on the D state at https://kerneltalks.com/linux/process-states-in-linux/ )
+********* utils/runbusy.sh *********
+#!/bin/bash
+# script to create lots of busy work by creating lots of busy processes
+
+# remove the file that stops us from running
+rm ~/.stoprunning
+
+# self-limit the script - create the file that will stop the scripts
+# after 100 seconds.  This removes the long term I/O-bound processes
+# that can cause the kernel the complain about a process being blocked
+# for more than 120 seconds
+(sleep 100; touch ~/.stoprunning)&
+
 while true
 do
    echo "Running script $0"
@@ -311,12 +332,34 @@ do
    fi
 done
 
+The following script runs the kernel test as root.
+********* utils/kernel_test.sh *********
+#!/bin/bash
+# script to run the kernel loadable module test
+# Note that this script needs to be run AFTER the kernel module
+# has been installed (insmod/modprobe)
+
+kernel_execute="/sys/gpio_control/pulse_run"
+
+if [ -f ${kernel_execute} ]
+then
+	echo "Running the kernel test"
+	sudo sh -c "echo g > ${kernel_execute}"
+    echo "Kernel test exited"
+else
+	echo "file ${kernel_execute} doesn't exist - have you installed the kernel module yet?"
+fi
+
+cat /sys/gpio_control/gpio_pin
+cat /sys/gpio_control/pulse_width
+cat /sys/gpio_control/user_delay_type
+cat /sys/gpio_control/pulse_run
 
 APPENDIX B - User space source code:
 
-To compile this code on the Raspberry Pi, put the following C source code in a file called user_pulse.c, and execute:
+To compile this code on the Raspberry Pi, put the following C source code in a file called user_pulse.c, and execute (note, you need to have already installed the bcm2835 libraries for accessing GPIO from user space:
 cc -o user_pulse user_pulse.c -lbcm2835
-**************** user_pulse.c C source code ****************
+**************** user_gpio_pulse/user_pulse.c C source code ****************
 // To isolate the core, edit the file /boot/cmdline.txt to have
 // isolcpus=3 (keep any task from normally being scheduled on the 4th
 // core)
@@ -422,50 +465,466 @@ APPENDIX C -
 To compile this code into a kernel module on a Raspberry Pi
 make -C /lib/modules/`uname -r`/build M=$PWD
 (note that you need to have the correct Linux kernel headers on the machine.  The easiest way to do this is to load the Linux source, and build the kernel on the Raspberry Pi)
+**************** driver_gpio_pulse/gpio_pulse.c C source code ****************
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/jiffies.h>
+#include <linux/delay.h> // for usleep_range
+#include <linux/gpio.h>
+#include <linux/fs.h>
+#include <linux/device.h>
+#include <linux/sysfs.h>
+#include <asm/uaccess.h>
+#include <linux/kobject.h>
+#include <linux/sched.h>
+
+#include <asm/io.h> // for talking to gpio
+#include <mach/platform.h> // for talkint to gpio
+
+// SANDRA, STOP dereferencing variable use the iowrite32 function!!!!!
+// utility functions
+
+//#define DISABLE_KERNEL_PREEMPTION 1
+// uncomment #define DISABLE_KERNEL_PREEMPTION if you wish to disable kernel preemption
+
+#define MAXLOOP 10000
+
+static inline unsigned ccnt_read (void)
+{
+    unsigned cc;
+    asm volatile ("mrc p15, 0, %0, c15, c12, 1" : "=r" (cc));
+    return cc;
+}
+
+// GPIO - structure reflects registers as defined in the Broadcom h/w spec
+// https://www.raspberrypi.org/wp-content/uploads/2012/02/BCM2835-ARM-Peripherals.pdf
+struct gpio_registers
+{
+    uint32_t GPFSEL[6];
+    uint32_t Reserved1;
+    uint32_t GPSET[2];
+    uint32_t Reserved2;
+    uint32_t GPCLR[2];
+    uint32_t Reserved3;
+    uint32_t GPLEV0[2];
+    uint32_t Reserved4;
+};
+
+struct gpio_registers *gpio_regs;
+#define GPIO_OUT 0b001
+#define GPIO_ON true
+#define GPIO_OFF false
+
+// set the gpio pin - input, output or alt function
+static void set_gpio_altfunc(int gpio, int altfunc)
+{
+    int reg_index = gpio / 10;
+    int bit = (gpio % 10) * 3;
+
+    unsigned old_value = gpio_regs->GPFSEL[reg_index];
+    unsigned mask = 0b111 << bit;
+    printk("Changing function of GPIO%d from %x to %x\n",
+           gpio,
+           (old_value >> bit) & 0b111,
+           altfunc);
+
+    gpio_regs->GPFSEL[reg_index] =
+        (old_value & ~mask) | ((altfunc << bit) & mask);
+}
+
+static void set_gpio_output_value(int gpio,  bool value)
+{
+    if (value)
+        gpio_regs->GPSET[gpio/32] = (1 << (gpio % 32));
+    else
+        gpio_regs->GPCLR[gpio/32] = (1 << (gpio % 32));
+}
 
 
+// probe - ideas - do setup, get device tree information
+// (e.g. pulse width parms), and set up the ISR
+// then start a pthread that can wait for a sysfs write
+// (poll or function sysfs) to tell it to do the first
+// pulse, and it will continue to do the pulses, incrementing
+// length based on the pulse width parms.  When the interrupt
+// comes, it will imeediately drop the pulse, and stop any future
+// pulses until the next sysfs request
+
+//SANDRA, need to add protected variable for current gpio state
+// When the interrupt happens, only set low if state is hi
+// when the hrtimer finishes the sleep, only set low if state is hi
+// Also another one for gpio_complete, and when set (only in the int), the
+// main thread won't do any new pulses if gpio_complete is set.
+
+
+static void run_pulse_test(int pulse_width, int gpio_pin);
+
+// objects/vars accessible to user
+static int Gpio_pin_to_drive = 4;  // default to 4, J8 Pin 7
+// note that the Shortest and Longest pulse_widths are stored in nsec,
+static int Shortest_pulse_width = 0x7FFFFFFF;  // biggest signed value
+static int Longest_pulse_width = 0;
+// but User_pulse_width is stored in usec
+static int User_pulse_width = 10 * 1000; // default to 10 ms
+// accumulated values to compute average
+static long long Run_time_average = 1;
+static int Average_divider = 1;
+
+static uint8_t Stop_loop = 0;
+
+enum user_delay_enum_type {mdelay_type, usleep_type, end_delay_types};
+// busy wait or kernel sleep for delay?
+static enum user_delay_enum_type User_delay_type = mdelay_type;
+
+static int get_average_pulse_width(void)
+{
+    long hold_numerator;
+    int average;
+
+    printk("Sandra, Run_time_average=%lld Average_divider=%d\n", Run_time_average, Average_divider);
+    if (Average_divider == 1)
+    {
+        return 0;
+    }
+
+    hold_numerator = Run_time_average;
+//    remainder = do_div(hold_numerator, Average_divider);
+    average = (int) div64_s64(Run_time_average, Average_divider);
+    printk("%s: average=%d, divider=%d\n",
+           __func__, average, Average_divider);
+    return average;
+}
+static void do_the_delay_or_sleep(int usec_min, int usec_max)
+{
+    if (User_delay_type == mdelay_type)
+    {
+        if (usec_min > 1000)
+        {
+            mdelay(usec_min/1000); // convert usec to msec
+        }
+        else
+        {
+            udelay(usec_min);
+        }
+
+    }
+    else if (User_delay_type == usleep_type)
+    {
+        usleep_range(usec_min, usec_max);
+    }
+}
+
+ssize_t show_pulse_width(struct device *dev,
+                         struct device_attribute *attr, char *buf)
+{
+    printk("%s, %d usec\n", __func__, User_pulse_width);
+    return sprintf(buf, "User set pulse width of %d usec\n",
+                   User_pulse_width);
+}
+
+ssize_t show_pulse_results(struct device *dev,
+                           struct device_attribute *attr, char *buf)
+{
+    printk("%s, L=%dnsec, S=%dnsec\n", __func__,
+           Longest_pulse_width, Shortest_pulse_width);
+    return sprintf(buf, "Results: longest=%dnsec, shortest=%dnsec, ave=%dnsec\n",
+                   Longest_pulse_width, Shortest_pulse_width,
+                   get_average_pulse_width());
+}
+
+ssize_t show_gpio_pin(struct device *dev,
+                      struct device_attribute *attr, char *buf)
+{
+    printk("%s, Driving gpio pin %d\n", __func__, Gpio_pin_to_drive);
+    return sprintf(buf, "Driving gpio pin %d\n", Gpio_pin_to_drive);
+}
+
+ssize_t show_user_delay_type(struct device *dev,
+                             struct device_attribute *attr, char *buf)
+{
+    if (User_delay_type == mdelay_type)
+    {
+        return sprintf(buf, "mdelay - busy/wait (val=%d)\n", User_delay_type);
+    }
+    else if (User_delay_type == usleep_type)
+    {
+        return sprintf(buf, "usleep_range, letting the kernel sleep (val=%d)\n", User_delay_type);
+    }
+    return 0; // should never reach here
+}
+
+// NOTE: user needs to set pulse width in usec
+ssize_t set_pulse_width(struct device *dev, struct device_attribute *attr,
+                        const char *buf, size_t len)
+{
+    int r;
+
+    r = kstrtoint(buf, 10, &User_pulse_width);
+    printk("%s: setting pulse width to %dusec\n", __func__, User_pulse_width);
+    return r ? 0 : len;
+}
+
+ssize_t start_pulse_run(struct device *dev, struct device_attribute *attr,
+                        const char *buf, size_t len)
+{
+    printk("%s: starting, width of %dusec\n", __func__, User_pulse_width);
+    run_pulse_test(User_pulse_width, Gpio_pin_to_drive);
+    return len;
+}
+
+ssize_t set_gpio_pin(struct device *dev, struct device_attribute *attr,
+                     const char *buf, size_t len)
+{
+    int r;
+
+    printk("%s\n", __func__);
+    r = kstrtoint(buf, 10, &Gpio_pin_to_drive);
+    set_gpio_altfunc(Gpio_pin_to_drive, GPIO_OUT);
+    return (r ? 0 : len);
+}
+
+ssize_t set_user_delay_type(struct device *dev, struct device_attribute *attr,
+                            const char *buf, size_t len)
+{
+    int r, hold_delay_type;
+
+    printk("%s\n", __func__);
+    r = kstrtoint(buf, 10, &hold_delay_type);
+    if (hold_delay_type < end_delay_types)
+    {
+        User_delay_type = (enum user_delay_enum_type) hold_delay_type;
+    }
+    return (r ? 0 : len);
+}
+
+ssize_t set_stop_loop(struct device *dev, struct device_attribute *attr,
+                 const char *buf, size_t len)
+{
+    printk("%s\n", __func__);
+
+    Stop_loop = 1;
+    return (len);
+}
+
+
+
+static void run_pulse_test(int pulse_width, int gpio_pin)
+{
+    int i, loopsize, x, sched_ret;
+    struct timespec starttime, endtime, deltatime;
+    const int cpu = 3; // /boot/cmdline.txt has isolcpus=3, so only we are on it
+    const struct sched_param sched_param = {.sched_priority = 99}; // highest rt priority
+    cpumask_t save_allowed;
+
+    Stop_loop = 0;
+    Run_time_average = 0;
+    if (User_delay_type == 0)
+    {
+        printk(KERN_INFO "doing mdelay - busy/wait\n");
+    }
+    else
+    {
+        printk(KERN_INFO "doing usleep_range, letting the kernel sleep\n");
+    }
+    printk(KERN_INFO "running pulse test - my pid is %d\n", current->pid);
+
+    save_allowed = current->cpus_allowed;
+    // set the cpu affinity of this process
+    if (set_cpus_allowed_ptr(current, cpumask_of(cpu)) != 0)
+    {
+        printk(KERN_ERR "cpu affinity returned error\n");
+    }
+    // set scheduler to RT SCHED_FIFO
+    sched_ret = sched_setscheduler(current, SCHED_FIFO, &sched_param);
+    if (sched_ret != 0)
+    {
+        printk(KERN_ERR "Setting scheduling to SCHED_FIFO returned error %d\n", sched_ret);
+    }
+#ifdef DISABLE_KERNEL_PREEMPTION
+    get_cpu();
+#endif
+
+    // initialize values
+    Shortest_pulse_width = 0x7FFFFFFF;  // biggest signed value
+    Longest_pulse_width = 0;
+
+
+    // start with value low
+    set_gpio_output_value(gpio_pin, GPIO_OFF);
+    loopsize = MAXLOOP;  // to make a shorter test, set loopsize to a smaller value
+    x = MAXLOOP/pulse_width;
+    // make the loopsize longer for short pulse widths
+    printk("sandra remove MAXLOOP=%d, pulsewidth  =%d x=%d\n", MAXLOOP, pulse_width, x);
+    loopsize *= x;
+
+    printk("loopsize is %d\n",loopsize);
+    for (i=0; i < loopsize; i++)
+    {
+        if (Stop_loop != 0)
+        {
+            break;
+            // get out of here
+        }
+        getnstimeofday(&starttime);
+        set_gpio_output_value(gpio_pin, GPIO_ON);
+
+// will we have a problem with interrupts since this is uninterruptible?  or will the isr fire fine?
+        do_the_delay_or_sleep(pulse_width, pulse_width);
+        set_gpio_output_value(gpio_pin, GPIO_OFF);
+        getnstimeofday(&endtime);
+
+// sleep to make the pulse obvious on oscope
+        do_the_delay_or_sleep(pulse_width * 2, pulse_width * 2);
+        deltatime = timespec_sub(endtime, starttime);
+        if (deltatime.tv_sec != 0)
+        {
+            printk(KERN_ERR "we had %lu second delay!!!!!  ERROR\n", deltatime.tv_sec);
+        }
+
+        if (deltatime.tv_nsec < Shortest_pulse_width)
+        {
+            Shortest_pulse_width = deltatime.tv_nsec;
+            printk(KERN_INFO "shortest time is now %d\n",
+                   Shortest_pulse_width);
+        }
+        if (deltatime.tv_nsec > Longest_pulse_width)
+        {
+            Longest_pulse_width = deltatime.tv_nsec;
+            printk(KERN_INFO "longest time is now %d\n",
+                   Longest_pulse_width);
+        }
+        // keep an average
+        Run_time_average += deltatime.tv_nsec;
+        Average_divider = i+1;
+    }
+#ifdef DISABLE_KERNEL_PREEMPTION
+    put_cpu();
+#endif
+    // put this task back on the un-isolated CPU core (restore the cpu affinity)
+    set_cpus_allowed_ptr(current, &save_allowed);
+    printk(KERN_INFO "longest %dnsec, shortest time was %dnsec, ave=%dnsec\n",
+           Longest_pulse_width, Shortest_pulse_width,
+           get_average_pulse_width());
+}
+
+#undef VERIFY_OCTAL_PERMISSIONS
+#define VERIFY_OCTAL_PERMISSIONS(perms) (perms)
+
+static DEVICE_ATTR(pulse_run, S_IWUSR | S_IRUGO, show_pulse_results, start_pulse_run);
+static DEVICE_ATTR(gpio_pin, S_IWUSR | S_IRUGO, show_gpio_pin, set_gpio_pin);
+static DEVICE_ATTR(pulse_width, S_IWUSR | S_IRUGO, show_pulse_width, set_pulse_width);
+static DEVICE_ATTR(user_delay_type, S_IWUSR | S_IRUGO, show_user_delay_type, set_user_delay_type);
+static DEVICE_ATTR(stop_run, S_IWUSR, NULL, set_stop_loop);
+
+static struct kobject *kobj;
+
+static int __init gpio_pulse_init(void)
+{
+    kobj = kobject_create_and_add("gpio_control", NULL);
+    if (kobj == NULL)
+    {
+        printk(KERN_ERR "kobj could not be created!!\n");
+        return -1;
+    }
+
+    if (sysfs_create_file(kobj, &dev_attr_pulse_run.attr) != 0)
+    {
+        printk(KERN_ERR "sysfs_create_file of pulse_run attr returned non 0 value\n");
+    }
+    if (sysfs_create_file(kobj, &dev_attr_gpio_pin.attr) != 0)
+    {
+        printk(KERN_ERR "sysfs_create_file of gpio_pin attr returned non 0 value\n");
+    }
+    if (sysfs_create_file(kobj, &dev_attr_pulse_width.attr) != 0)
+    {
+        printk(KERN_ERR "sysfs_create_file of pulse_width attr returned non 0 value\n");
+    }
+    if (sysfs_create_file(kobj, &dev_attr_user_delay_type.attr) != 0)
+    {
+        printk(KERN_ERR "sysfs_create_file of user_delay_type attr returned non 0 value\n");
+    }
+    if (sysfs_create_file(kobj, &dev_attr_stop_run.attr) != 0)
+    {
+        printk(KERN_ERR "sysfs_create_file of stop_run attr returned non 0 value\n");
+    }
+
+    // set up gpio access
+    gpio_regs = (struct gpio_registers *)__io_address(GPIO_BASE);
+    // set up the default gpio pin,
+    set_gpio_altfunc(Gpio_pin_to_drive, GPIO_OUT);
+
+    return 0;
+}
+
+static void __exit gpio_pulse_exit(void)
+{
+    printk(KERN_INFO "Exiting: cleanup\n");
+
+    // remove the sysfs files
+    sysfs_remove_file(kobj, &dev_attr_pulse_width.attr);
+    sysfs_remove_file(kobj, &dev_attr_gpio_pin.attr);
+    sysfs_remove_file(kobj, &dev_attr_pulse_run.attr);
+    sysfs_remove_file(kobj, &dev_attr_user_delay_type.attr);
+    // remove the kernel object
+    kobject_put(kobj);
+}
+
+module_init(gpio_pulse_init);
+module_exit(gpio_pulse_exit);
+
+
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("Control gpio pulse with < 1msec accuracy");
+MODULE_VERSION("Jan 1 2017");
+
+
+***************
 
 APPENDIX D  - how to run the user space program and the busy scripts on the Raspberry Pi
-(first make sure you have properly isolated a core with the isolcpus command.  Verify this worked by doing:    cat /sys/devices/system/cpu/isolated )
+SANDRA, create a separate appendix talking about how to isolate a CPU, and move this discussion there.  Then just put a comment here that says:
+(first make sure you have properly isolated a CPU core - we will assume core 3 for this discussion.  See Appendix ?? for a discussion of how to isolate a CPU core)
+
+MOVE THIS TO AN APPENDIX ON ISOLATING CPUS(first make sure you have properly isolated a core with the isolcpus command.  Verify this worked by doing:    cat /sys/devices/system/cpu/isolated )
  if the output is a 3, and you did isolcpus=3, then you are good)
 
 * create 3 terminal windows (either ssh into the RPi, or in the RPi GUI)
 
-To allow the busy scripts to run, in terminal 1:
-   rm ~/.stoprunning
-
 To run the busy scripts, in terminal 2:
-   ./runbusy.sh
+   (cd utils; ./runbusy.sh)
 
-To stop the busy scripts, in terminal 1:
+To stop the busy scripts, do the following in terminal 1 (but the scripts will stop in 100 seconds automatically anyway):
    touch ~/.stoprunning
 
 To run the userspace program on with a 10ms pulse train, in terminal 3:
-   taskset 0x8 ./user_pulse 10000
+   sudo taskset 0x8 ./user_pulse 10000
    (the value you provide is in microseconds, so scale accordingly)
 
 And normally, I would be running top in terminal 1, to see if anything was on CPU core 3.  Note that this also adds to the execution load on the system.
 
 
 APPENDIX E  - how to run the kernel module and the busy scripts on the Raspberry Pi
-(first make sure you have properly isolated a core with the isolcpus command.  Verify this worked by doing:    cat /sys/devices/system/cpu/isolated )
+SANDRA, create a separate appendix talking about how to isolate a CPU, and move this discussion there.  Then just put a comment here that says:
+(first make sure you have properly isolated a CPU core - we will assume core 3 for this discussion.  See Appendix ?? for a discussion of how to isolate a CPU core)
+
+SANDRA, MOVE THIS TO APPENDIX ON ISOLATING CPUS(first make sure you have properly isolated a core with the isolcpus command.  Verify this worked by doing:    cat /sys/devices/system/cpu/isolated )
  if the output is a 3, and you did isolcpus=3, then you are good)
+
+* If you wish to run with kernel preemption disabled, modify gpio_pulse.c - uncomment the #define DISALBE_KERNEL_PREEMPTION 1 line.
 
 * create 4 terminal windows (either ssh into the RPi, or in the RPi GUI)
 
-To allow the busy scripts to run, in terminal 1:
-   rm ~/.stoprunning
-
 To run the busy scripts, in terminal 2:
-   ./runbusy.sh
+   (cd utils; ./runbusy.sh)
 
-To stop the busy scripts, in terminal 1:
+To stop the busy scripts, do the following in terminal 1 (but the scripts will stop in 100 seconds automatically anyway):
    touch ~/.stoprunning
 
-To run the kernel module, in terminal 3:
-   sudo insmod gpio_pulse.ko
-   sudo chmod 666 /sys/gpio_control/*
-   echo g > /sys/gpio_control/pulse_run **** SANDRA WARNING MUST BE ROOT OR THE PRIORITY IS BAD!!!  WAS THIS A PROBLEM FOR THE USER SPACE PROGRAM????
+To run the kernel module, first you have to install the kernel module (KLM), in terminal 3:
+   sudo insmod driver_gpio_pulse/gpio_pulse.ko  (loads the KLM into the kernel)
+   sudo chmod 666 /sys/gpio_control/*           (gives the pi user permission to control the KLM)
+
+And then run the kernel module in terminal 3:
+   utils/kernel_test.sh                         (runs the KLM)
 
 To see the results from the run:
    cat /sys/gpio_control/pulse_run
@@ -482,7 +941,6 @@ To modify the defined run parameters (which GPIO pin to drive, and the width of 
 
 If you have modified the kernel module and need re-install it, you have to uninstall the module, before re-installing it:
    sudo rmmod gpio_pulse.ko
-   sudo insmod gpio_pulse.ko
 
 And normally, I would be running top in terminal 1, to see if anything was on CPU core 3.  Note that this also adds to the execution load on the system.
 
@@ -502,3 +960,4 @@ https://github.com/gby/linux/wiki
 
 per-CPU kthreads
 https://www.kernel.org/doc/Documentation/kernel-per-CPU-kthreads.txt
+

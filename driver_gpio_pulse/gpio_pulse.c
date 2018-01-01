@@ -16,6 +16,9 @@
 // SANDRA, STOP dereferencing variable use the iowrite32 function!!!!!
 // utility functions
 
+//#define DISABLE_KERNEL_PREEMPTION 1
+// uncomment #define DISABLE_KERNEL_PREEMPTION if you wish to disable kernel preemption
+
 #define MAXLOOP 10000
 
 static inline unsigned ccnt_read (void)
@@ -256,19 +259,6 @@ static void run_pulse_test(int pulse_width, int gpio_pin)
         printk(KERN_INFO "doing usleep_range, letting the kernel sleep\n");
     }
     printk(KERN_INFO "running pulse test - my pid is %d\n", current->pid);
-//    printk(KERN_ERR "Sandra, setting GPIO LOW FIRST (with x) \n");
-//    set_gpio_output_value(gpio_pin, GPIO_OFF);
-//    msleep(1000 * 20);
-//    printk(KERN_ERR "Sandra, setting GPIO HI NOW\n");
-//    set_gpio_output_value(gpio_pin, GPIO_ON);
-//    msleep(1000 * 20);
-//    printk(KERN_ERR "Sandra, again setting GPIO LOW \n");
-//    set_gpio_output_value(gpio_pin, GPIO_OFF);
-//    msleep(1000 * 20);
-//    printk(KERN_ERR "Sandra, setting GPIO HI NOW\n");
-//    set_gpio_output_value(gpio_pin, GPIO_ON);
-//    printk(KERN_ERR "Sandra, done with GPIO - hack quit\n");
-//    return(0);
 
     save_allowed = current->cpus_allowed;
     // set the cpu affinity of this process
@@ -282,8 +272,9 @@ static void run_pulse_test(int pulse_width, int gpio_pin)
     {
         printk(KERN_ERR "Setting scheduling to SCHED_FIFO returned error %d\n", sched_ret);
     }
-    // turn off kernel preemption
+#ifdef DISABLE_KERNEL_PREEMPTION
     get_cpu();
+#endif
 
     // initialize values
     Shortest_pulse_width = 0x7FFFFFFF;  // biggest signed value
@@ -338,8 +329,9 @@ static void run_pulse_test(int pulse_width, int gpio_pin)
         Run_time_average += deltatime.tv_nsec;
         Average_divider = i+1;
     }
-    // allow kernel preemption
+#ifdef DISABLE_KERNEL_PREEMPTION
     put_cpu();
+#endif
     // put this task back on the un-isolated CPU core (restore the cpu affinity)
     set_cpus_allowed_ptr(current, &save_allowed);
     printk(KERN_INFO "longest %dnsec, shortest time was %dnsec, ave=%dnsec\n",
@@ -414,5 +406,5 @@ module_exit(gpio_pulse_exit);
 
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Control gpio pulse with 1msec accuracy");
-MODULE_VERSION("Dec 18 2016");
+MODULE_DESCRIPTION("Control gpio pulse with < 1msec accuracy");
+MODULE_VERSION("Jan 1 2017");
